@@ -20,6 +20,8 @@ our @EXPORT_OK = qw(
   list_of
   list_values_of
   lookfor
+  lookahead
+  neg_lookahead
   match
   nothing
   null_list
@@ -29,6 +31,7 @@ our @EXPORT_OK = qw(
   rlist_of
   rlist_values_of
   star
+  plus
   T
   test
 );
@@ -52,7 +55,7 @@ our $VERSION = '0.02_01';
 =head1 SYNOPSIS
 
   use HOP::Parser qw/:all/;
-  
+
   # assemble a bunch of parsers according to a grammar
 
 =head1 DESCRIPTION
@@ -97,6 +100,10 @@ functions could stand to be better named (C<rlist_of>, for example).
 
 =item * match
 
+=item * lookahead
+
+=item * neg_lookahead
+
 =item * nothing
 
 =item * null_list
@@ -112,6 +119,8 @@ functions could stand to be better named (C<rlist_of>, for example).
 =item * rlist_values_of
 
 =item * star
+
+=item * plus
 
 =item * T
 
@@ -203,6 +212,8 @@ used instead.
 
 =cut
 
+my $is_node = sub { is_node($_[0]) || ref $_[0] eq 'ARRAY' };
+
 sub lookfor {
     my $wanted = shift;
     my $value  = shift || sub { $_[0][1] };
@@ -232,9 +243,8 @@ sub lookfor {
         # Otherwise, the AoA stream might just return an aref for
         # the tail instead of an AoA.  This breaks things
         my $tail = tail($input);
-        if ( is_node($tail) and not is_node( head($tail) ) ) {
-            $tail = [$tail];
-        }
+        $tail = [$tail]
+            if $is_node->($tail) and not $is_node->($tail->[0]);
         return ( $wanted_value, $tail );
     };
     $N{$parser} = "[@$wanted]";
@@ -271,10 +281,59 @@ sub parser (&) { $_[0] }
 
 ##############################################################################
 
+=head2 lookahead
+
+  my $parser = lookahead( $label );
+  $parser = lookahead( $parser );
+
+This function takes a parser argument or list of arguments supported by
+C<lookfor()> and returns a parser that will return true if the parser matches,
+but does not actually change the stream. This is so that you can write parsers
+that match something and then look ahead to see if they match the next thing,
+without actualy consuming that next thing. This is akin to a zero width
+positive look-ahead in a regular expression.
+
+=cut
+
+sub lookahead {
+    my $p = ref $_[0] eq 'CODE' ? shift : lookfor @_;
+    parser {
+        my $input = shift or return;
+        $p->($input);
+        return (undef, $input);
+    },
+}
+
+##############################################################################
+
+=head2 neg_lookahead
+
+  my $parser = neg_lookahead( $label );
+  $parser = neg_lookahead( $parser );
+
+This function returns a parser that returns true if it looks ahead and does
+not find a match for the specified parser. That is, it's akin to a zero width
+negative look-ahead in a regular expression. The supported arguments are the
+same as for C<lookahead()>.
+
+=cut
+
+sub neg_lookahead {
+    my $p = ref $_[0] eq 'CODE' ? shift : lookfor @_;
+    parser {
+        my $input = shift or return;
+        my @ret = eval { $p->($input) };
+        die [ 'TOKEN', $input, $p ] if @ret;
+        return (undef, $input);
+    },
+}
+
+##############################################################################
+
 =head2 concatenate
 
   my $parser = concatenate(@parsers);
-  ok ($values, $remainder) = $parser->($stream);
+  my ($values, $remainder) = $parser->($stream);
 
 This function takes a list of parsers and returns a new parser. The new parser
 succeeds if all parsers passed to C<concatenate> succeed sequentially.
@@ -362,15 +421,7 @@ sub list_of {
 
     return T(
         concatenate( $element, star( concatenate( $separator, $element ) ) ),
-        sub {
-            my @matches = shift;
-            if ( my $tail = shift ) {
-                foreach my $match (@$tail) {
-                    push @matches, @$match;
-                }
-            }
-            return \@matches;
-        }
+        sub {[ $_[0], $_[1] ? map { @$_ } @{ $_[1] } : () ] },
     );
 }
 
@@ -518,11 +569,16 @@ sub null_list {
   my ($parsed, $remainder) = $parser->($stream);
 
 This parser always succeeds and matches zero or more instances of
-C<$another_parser>.  If it matches zero, it returns the same results as
-C<null_list>.  Otherwise, it returns and array ref of the matched values and
-the remainder of the stream.
+C<$another_parser>. It parallels the regular expression C<*> quantifier. If it
+matches zero, it returns the same results as C<null_list>. Otherwise, it
+returns and array ref of the matched values and the remainder of the stream.
 
 =cut
+
+my $star_plus_t = sub {
+    my ( $first, $rest ) = @_;
+    [ $first, @$rest ];
+};
 
 sub star {
     my $p = shift;
@@ -530,12 +586,31 @@ sub star {
     $p_star = alternate(
         T(
             concatenate( $p, parser { $p_star->(@_) } ),
-            sub {
-                my ( $first, $rest ) = @_;
-                [ $first, @$rest ];
-            }
+            $star_plus_t,
         ),
         \&null_list
+    );
+}
+
+##############################################################################
+
+=head2 plus
+
+  my $parser = plus($another_parser);
+  my ($parsed, $remainder) = $parser->($stream);
+
+This parser succeeds when it matches one or more instances of
+C<$another_parser>. It parallels the regular expression C<+> quantifier. If it
+matches one or more, it returns and array ref of the matched values and the
+remainder of the stream.
+
+=cut
+
+sub plus {
+    my $p = shift;
+    T(
+        concatenate( $p, star($p) ),
+        $star_plus_t,
     );
 }
 
@@ -544,9 +619,10 @@ sub star {
 =head2 optional
 
  my $parser = optional($another_parser);
- my ($parser, $remainder) = $parser->(stream); 
+ my ($parser, $remainder) = $parser->(stream);
 
-This parser matches 0 or 1 of the given parser item.
+This parser matches 0 or 1 of the given parser item. It parallels the regular
+expression C<?> quantifier.
 
 =cut
 
@@ -768,7 +844,7 @@ identifying the original source of the Software: "from Higher-Order Perl by
 Mark Dominus, published by Morgan Kaufmann Publishers, Copyright 2005 by
 Elsevier Inc".
 
-=item 2 Disclaimer of Warranty. 
+=item 2 Disclaimer of Warranty.
 
 We make no warranties at all. The Software is transferred to you on an "as is"
 basis. You use the Software at your own peril. You assume all risk of loss for
@@ -779,7 +855,7 @@ any patent, copyright, or proprietary right. All other warranties, expressed
 or implied, including, without limitation, any warranty of merchantability or
 fitness for a particular purpose are hereby excluded.
 
-=item 3 Limitation of Liability. 
+=item 3 Limitation of Liability.
 
 We will have no liability for special, incidental, or consequential damages
 even if advised of the possibility of such damages. We will not be liable for
